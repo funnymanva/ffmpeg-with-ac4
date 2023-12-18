@@ -1,0 +1,1048 @@
+#!/bin/bash
+
+# Based on below with more libraries added and updates to the original ones
+# HOMEPAGE: https://github.com/markus-perl/ffmpeg-build-script
+# LICENSE: https://github.com/markus-perl/ffmpeg-build-script/blob/master/LICENSE
+
+PROGNAME=$(basename "$0")
+VERSION=1.24
+CWD=$(pwd)
+PACKAGES="$CWD/packages"
+WORKSPACE="$CWD/workspace"
+CFLAGS="-I$WORKSPACE/include"
+LDFLAGS="-L$WORKSPACE/lib"
+LDEXEFLAGS=""
+EXTRALIBS="-ldl -lpthread -lm -lz -lstdc++"
+MACOS_M1=false
+CONFIGURE_OPTIONS=()
+NONFREE_AND_GPL=false
+
+# Check for Apple Silicon
+if [[ ("$(uname -m)" == "arm64") && ("$OSTYPE" == "darwin"*) ]]; then
+  # If arm64 AND darwin (macOS)
+  export ARCH=arm64
+  export MACOSX_DEPLOYMENT_TARGET=11.0
+  MACOS_M1=true
+fi
+
+# Speed up the process
+# Env Var NUMJOBS overrides automatic detection
+if [[ -n "$NUMJOBS" ]]; then
+  MJOBS="$NUMJOBS"
+elif [[ -f /proc/cpuinfo ]]; then
+  MJOBS=$(grep -c processor /proc/cpuinfo)
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+  MJOBS=$(sysctl -n machdep.cpu.thread_count)
+  CONFIGURE_OPTIONS=("--enable-videotoolbox")
+else
+  MJOBS=4
+fi
+
+make_dir() {
+  remove_dir "$1"
+  if ! mkdir "$1"; then
+    printf "\n Failed to create dir %s" "$1"
+    exit 1
+  fi
+}
+
+remove_dir() {
+  if [ -d "$1" ]; then
+    rm -r "$1"
+  fi
+}
+
+download() {
+  # download url [filename[dirname]]
+
+  DOWNLOAD_PATH="$PACKAGES"
+  DOWNLOAD_FILE="${2:-"${1##*/}"}"
+
+  if [[ "$DOWNLOAD_FILE" =~ tar. ]]; then
+    TARGETDIR="${DOWNLOAD_FILE%.*}"
+    TARGETDIR="${3:-"${TARGETDIR%.*}"}"
+  else
+    TARGETDIR="${3:-"${DOWNLOAD_FILE%.*}"}"
+  fi
+
+  if [ ! -f "$DOWNLOAD_PATH/$DOWNLOAD_FILE" ]; then
+    echo "Downloading $1 as $DOWNLOAD_FILE"
+    curl -L --silent -o "$DOWNLOAD_PATH/$DOWNLOAD_FILE" "$1"
+
+    EXITCODE=$?
+    if [ $EXITCODE -ne 0 ]; then
+      echo ""
+      echo "Failed to download $1. Exitcode $EXITCODE. Retrying in 10 seconds"
+      sleep 10
+      curl -L --silent -o "$DOWNLOAD_PATH/$DOWNLOAD_FILE" "$1"
+    fi
+
+    EXITCODE=$?
+    if [ $EXITCODE -ne 0 ]; then
+      echo ""
+      echo "Failed to download $1. Exitcode $EXITCODE"
+      exit 1
+    fi
+
+    echo "... Done"
+  else
+    echo "$DOWNLOAD_FILE has already downloaded."
+  fi
+
+  make_dir "$DOWNLOAD_PATH/$TARGETDIR"
+
+  if [ -n "$3" ]; then
+    tar --no-same-owner --no-same-permissions -xvf "$DOWNLOAD_PATH/$DOWNLOAD_FILE" -C "$DOWNLOAD_PATH/$TARGETDIR" 2>/dev/null >/dev/null
+    res=$?
+    if [[ ${res} -ne 0 ]]; then
+      echo "Failed to extract $DOWNLOAD_FILE"
+      exit 1
+    fi
+  else
+    tar --no-same-owner --no-same-permissions -xvf "$DOWNLOAD_PATH/$DOWNLOAD_FILE" -C "$DOWNLOAD_PATH/$TARGETDIR" --strip-components 1 2>/dev/null >/dev/null
+    res=$?
+    if [[ ${res} -ne 0 ]]; then
+      echo "Failed to extract $DOWNLOAD_FILE"
+      exit 1
+    fi
+  fi
+
+  echo "Extracted $DOWNLOAD_FILE"
+
+  cd "$DOWNLOAD_PATH/$TARGETDIR" || (
+    echo "Error has occurred."
+    exit 1
+  )
+}
+
+execute() {
+  echo "$ $*"
+
+  OUTPUT=$("$@" 2>&1)
+
+  # shellcheck disable=SC2181
+  if [ $? -ne 0 ]; then
+    echo "$OUTPUT"
+    echo ""
+    echo "Failed to Execute $*" >&2
+    exit 1
+  fi
+}
+
+build() {
+  echo ""
+  echo "building $1"
+  echo "======================="
+
+  if [ -f "$PACKAGES/$1.done" ]; then
+    echo "$1 already built. Remove $PACKAGES/$1.done lockfile to rebuild it."
+    return 1
+  fi
+
+  return 0
+}
+
+command_exists() {
+  if ! [[ -x $(command -v "$1") ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
+library_exists() {
+  if ! [[ $(pkg-config --exists --print-errors "$1" 2>&1 >/dev/null) -eq 0 ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
+build_done() {
+  touch "$PACKAGES/$1.done"
+}
+
+verify_binary_type() {
+  if ! command_exists "file"; then
+    return
+  fi
+
+  BINARY_TYPE=$(file "$WORKSPACE/bin/ffmpeg" | sed -n 's/^.*\:\ \(.*$\)/\1/p')
+  echo ""
+  case $BINARY_TYPE in
+  "Mach-O 64-bit executable arm64")
+    echo "Successfully built Apple Silicon (M1) for ${OSTYPE}: ${BINARY_TYPE}"
+    ;;
+  *)
+    echo "Successfully built binary for ${OSTYPE}: ${BINARY_TYPE}"
+    ;;
+  esac
+}
+
+cleanup() {
+  remove_dir "$PACKAGES"
+  remove_dir "$WORKSPACE"
+  echo "Cleanup done."
+  echo ""
+}
+
+usage() {
+  echo "Usage: $PROGNAME [OPTIONS]"
+  echo "Options:"
+  echo "  -h, --help                     Display usage information"
+  echo "      --version                  Display version information"
+  echo "  -b, --build                    Starts the build process"
+  echo "      --enable-gpl-and-non-free  Enable GPL and non-free codecs  - https://ffmpeg.org/legal.html"
+  echo "  -c, --cleanup                  Remove all working dirs"
+  echo "      --full-static              Build a full static FFmpeg binary (eg. glibc, pthreads etc...) **only Linux**"
+  echo "                                 Note: Because of the NSS (Name Service Switch), glibc does not recommend static links."
+  echo ""
+}
+
+while (($# > 0)); do
+  case $1 in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  --version)
+    echo "$VERSION"
+    exit 0
+    ;;
+  -*)
+    if [[ "$1" == "--build" || "$1" =~ '-b' ]]; then
+      bflag='-b'
+    fi
+    if [[ "$1" == "--enable-gpl-and-non-free" ]]; then
+      CONFIGURE_OPTIONS+=("--enable-nonfree")
+      CONFIGURE_OPTIONS+=("--enable-gpl")
+      NONFREE_AND_GPL=true
+    fi
+    if [[ "$1" == "--cleanup" || "$1" =~ '-c' && ! "$1" =~ '--' ]]; then
+      cflag='-c'
+      cleanup
+    fi
+    if [[ "$1" == "--full-static" ]]; then
+      if [[ "$OSTYPE" == "darwin"* ]]; then
+        echo "Error: A full static binary can only be build on Linux."
+        exit 1
+      fi
+      LDEXEFLAGS="-static"
+    fi
+    shift
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+  esac
+done
+
+echo "ffmpeg-build-script v$VERSION"
+echo "========================="
+echo ""
+
+if [ -z "$bflag" ]; then
+  if [ -z "$cflag" ]; then
+    usage
+    exit 1
+  fi
+  exit 0
+fi
+
+echo "Using $MJOBS make jobs simultaneously."
+
+if [ -n "$LDEXEFLAGS" ]; then
+  echo "Start the build in full static mode."
+fi
+
+mkdir -p "$PACKAGES"
+mkdir -p "$WORKSPACE"
+
+export PATH="${WORKSPACE}/bin:$PATH"
+PKG_CONFIG_PATH="${WORKSPACE}/lib64/pkgconfig:/app/workspace/lib/pkgconfi"
+PKG_CONFIG_PATH+=":/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig"
+PKG_CONFIG_PATH+=":/usr/local/share/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig:/usr/lib64/pkgconfig"
+export PKG_CONFIG_PATH
+
+if ! command_exists "make"; then
+  echo "make not installed."
+  exit 1
+fi
+
+if ! command_exists "g++"; then
+  echo "g++ not installed."
+  exit 1
+fi
+
+if ! command_exists "curl"; then
+  echo "curl not installed."
+  exit 1
+fi
+
+if ! command_exists "python"; then
+  echo "Python command not found. Lv2 filter will not be available."
+fi
+
+##
+## build tools
+##
+
+if build "pkg-config"; then
+  download "https://pkgconfig.freedesktop.org/releases/pkg-config-0.29.2.tar.gz"
+  execute ./configure --silent --prefix="${WORKSPACE}" --with-pc-path="${WORKSPACE}"/lib/pkgconfig --with-internal-glib
+  execute make -j $MJOBS
+  execute make install
+  build_done "pkg-config"
+fi
+
+if command_exists "python"; then
+
+  if build "lv2"; then
+    download "https://lv2plug.in/spec/lv2-1.18.0.tar.bz2" "lv2-1.18.0.tar.bz2"
+    execute ./waf configure --prefix="${WORKSPACE}" --lv2-user
+    execute ./waf
+    execute ./waf install
+
+    build_done "lv2"
+  fi
+
+  if build "waflib"; then
+    download "https://gitlab.com/drobilla/autowaf/-/archive/cc37724b9bfa889baebd8cb10f38b8c7cab83e37/autowaf-cc37724b9bfa889baebd8cb10f38b8c7cab83e37.tar.gz" "autowaf.tar.gz"
+    build_done "waflib"
+  fi
+
+  if build "serd"; then
+    download "https://gitlab.com/drobilla/serd/-/archive/v0.30.6/serd-v0.30.6.tar.gz" "serd-v0.30.6.tar.gz"
+    execute cp -r "${PACKAGES}"/autowaf/* "${PACKAGES}/serd-v0.30.6/waflib/"
+    execute ./waf configure --prefix="${WORKSPACE}" --static --no-shared --no-posix
+    execute ./waf
+    execute ./waf install
+    build_done "serd"
+  fi
+
+  if build "pcre"; then
+    download "https://downloads.sourceforge.net/project/pcre/pcre/8.45/pcre-8.45.tar.bz2"
+    execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static
+    execute make -j $MJOBS
+    execute make install
+
+    build_done "pcre"
+  fi
+
+  if build "sord"; then
+    download "https://gitlab.com/drobilla/sord/-/archive/v0.16.6/sord-v0.16.6.tar.gz" "sord-v0.16.6.tar.gz"
+    execute cp -r "${PACKAGES}"/autowaf/* "${PACKAGES}/sord-v0.16.6/waflib/"
+    execute ./waf configure --prefix="${WORKSPACE}" CFLAGS="${CFLAGS}" --static --no-shared --no-utils
+    execute ./waf CFLAGS="${CFLAGS}"
+    execute ./waf install
+
+    build_done "sord"
+  fi
+
+  if build "sratom"; then
+    download "https://gitlab.com/lv2/sratom/-/archive/v0.6.6/sratom-v0.6.6.tar.gz" "sratom-v0.6.6.tar.gz"
+    execute cp -r "${PACKAGES}"/autowaf/* "${PACKAGES}/sratom-v0.6.6/waflib/"
+    execute ./waf configure --prefix="${WORKSPACE}" --static --no-shared
+    execute ./waf
+    execute ./waf install
+
+    build_done "sratom"
+  fi
+
+  if build "lilv"; then
+    download "https://gitlab.com/lv2/lilv/-/archive/v0.24.10/lilv-v0.24.10.tar.gz" "lilv-v0.24.10.tar.gz"
+    execute cp -r "${PACKAGES}"/autowaf/* "${PACKAGES}/lilv-v0.24.10/waflib/"
+    execute ./waf configure --prefix="${WORKSPACE}" --static --no-shared --no-utils
+    execute ./waf
+    execute ./waf install
+    CFLAGS+=" -I$WORKSPACE/include/lilv-0"
+    build_done "lilv"
+  fi
+
+  CONFIGURE_OPTIONS+=("--enable-lv2")
+fi
+
+if build "yasm"; then
+  download "https://github.com/yasm/yasm/releases/download/v1.3.0/yasm-1.3.0.tar.gz"
+  execute ./configure --prefix="${WORKSPACE}"
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "yasm"
+fi
+
+if build "nasm"; then
+  download "https://www.nasm.us/pub/nasm/releasebuilds/2.16.01/nasm-2.16.01.tar.xz"
+  execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "nasm"
+fi
+
+if build "zlib"; then
+  download "https://www.zlib.net/zlib-1.3.tar.gz"
+  execute ./configure --static --prefix="${WORKSPACE}"
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "zlib"
+fi
+
+if build "bzip2"; then
+  download "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz"
+  execute make -j $MJOBS install PREFIX="${WORKSPACE}"
+  cat << _EOF_ > "${WORKSPACE}/lib/pkgconfig/bzip2.pc"
+prefix=${WORKSPACE}
+exec_prefix=\${prefix}
+bindir=\${prefix}/bin
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+
+Name: bzip2
+Description: Lossless, block-sorting data compression
+URL: https://sourceware.org/bzip2
+Version: 1.0.8
+Libs: -L\${libdir} -lbz2
+Cflags: -I\${includedir}
+_EOF_
+
+  build_done "bzip2"
+fi
+
+if build "libpng"; then
+  download "https://downloads.sourceforge.net/project/libpng/libpng16/1.6.40/libpng-1.6.40.tar.xz"
+  TMP_LDFLAGS="${LDFLAGS}"
+  TMP_CFLAGS="${CFLAGS}"
+  export LDFLAGS="-L${WORKSPACE}/lib"
+  export CFLAGS="-I${WORKSPACE}/include"
+  execute ./configure --enable-static --disable-shared --prefix="${WORKSPACE}" --disable-dependency-tracking --disable-silent-rules
+  unset LDFLAGS
+  unset CFLAGS
+  LDFLAGS="${TMP_LDFLAGS}"
+  CFLAGS="${TMP_CFLAGS}"
+  grep '^DEFAULT_INCLUDES' Makefile
+  # Configure doesn't seem to keep include paths above in Makefile
+  sed -i'' "s|^DEFAULT_INCLUDES.*|DEFAULT_INCLUDES = -I. -I${WORKSPACE}/include|g" Makefile
+  grep '^DEFAULT_INCLUDES' Makefile
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "libpng"
+fi
+
+if build "pcre2"; then
+  download "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.42/pcre2-10.42.tar.bz2"
+  TMP_CFLAGS="${CFLAGS}"
+  export LIBS="-L${WORKSPACE}/lib -lz"
+  export CFLAGS="-I${WORKSPACE}/include"
+  execute ./configure --prefix="${WORKSPACE}" --enable-static --disable-shared --disable-dependency-tracking --enable-pcre2-16 --enable-pcre2-32 --enable-pcre2grep-libz --enable-pcre2grep-libbz2 --enable-jit
+  unset LIBS
+  unset CFLAGS
+  CFLAGS="${TMP_CFLAGS}"
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "pcre2"
+fi
+
+if build "expat"; then
+  download "https://github.com/libexpat/libexpat/releases/download/R_2_5_0/expat-2.5.0.tar.xz"
+  execute ./configure --prefix="${WORKSPACE}" --enable-static --disable-shared --without-docbook
+  execute make -j $MJOBS
+  execute make install
+  build_done "expat"
+fi
+
+if build "glib"; then
+  download "https://download.gnome.org/sources/glib/2.78/glib-2.78.3.tar.xz"
+  execute meson setup build --prefix="${WORKSPACE}" --libdir=lib --buildtype=release --wrap-mode=nofallback --default-library=static -Dbsymbolic_functions=false -Ddtrace=false -Dglib_debug=disabled
+  execute meson compile -C build --verbose
+  execute meson install -C build
+
+  build_done "glib"
+fi
+
+if build "icu4c"; then
+  download "https://github.com/unicode-org/icu/releases/download/release-73-2/icu4c-73_2-src.tgz"
+  cd source
+  execute ./configure --prefix="${WORKSPACE}" --enable-static --disable-shared --disable-samples --disable-tests --with-library-bits=64
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "icu4c"
+fi
+
+
+if $NONFREE_AND_GPL; then
+if build "openssl"; then
+  download "https://www.openssl.org/source/openssl-3.0.12.tar.gz"
+  if $MACOS_M1; then
+    sed -n 's/\(##### GNU Hurd\)/"darwin64-arm64-cc" => { \n    inherit_from     => [ "darwin-common", asm("aarch64_asm") ],\n    CFLAGS           => add("-Wall"),\n    cflags           => add("-arch arm64 "),\n    lib_cppflags     => add("-DL_ENDIAN"),\n    bn_ops           => "SIXTY_FOUR_BIT_LONG", \n    perlasm_scheme   => "macosx", \n}, \n\1/g' Configurations/10-main.conf
+    execute ./configure --prefix="${WORKSPACE}" no-shared no-asm darwin64-arm64-cc
+  else
+    execute ./config --prefix="${WORKSPACE}" --openssldir="${WORKSPACE}" --with-zlib-include="${WORKSPACE}"/include/ --with-zlib-lib="${WORKSPACE}"/lib no-shared zlib
+  fi
+  execute make -j $MJOBS
+  execute make install_sw
+  build_done "openssl"
+fi
+CONFIGURE_OPTIONS+=("--enable-openssl")
+fi
+
+if build "cmake"; then
+  download "https://cmake.org/files/v3.28/cmake-3.28.0.tar.gz"
+  execute ./bootstrap -- -DCMAKE_USE_OPENSSL=OFF
+  execute ./configure --prefix="${WORKSPACE}"
+  execute make -j $MJOBS
+  execute make install
+  build_done "cmake"
+fi
+
+if ! $MACOS_M1; then
+  if build "svtav1"; then
+    download "https://gitlab.com/AOMediaCodec/SVT-AV1/-/archive/v1.7.0/SVT-AV1-v1.7.0.tar.gz"
+    cd Build/linux || exit
+    execute cmake -DCMAKE_INSTALL_PREFIX="${WORKSPACE}" -DENABLE_SHARED=off -DBUILD_SHARED_LIBS=OFF ../.. -G"Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
+    execute make -j $MJOBS
+    execute make install
+    execute cp SvtAv1Enc.pc "${WORKSPACE}/lib/pkgconfig/"
+    execute cp SvtAv1Dec.pc "${WORKSPACE}/lib/pkgconfig/"
+    build_done "svtav1"
+  fi
+  CONFIGURE_OPTIONS+=("--enable-libsvtav1")
+fi
+
+if $NONFREE_AND_GPL; then
+if build "x264"; then
+  download "https://code.videolan.org/videolan/x264/-/archive/stable/x264-stable.tar.gz"
+  #cd "${PACKAGES}"/x264-0d754ec || exit
+
+  if [[ "$OSTYPE" == "linux-gnu" ]]; then
+    execute ./configure --prefix="${WORKSPACE}" --enable-static --enable-pic CXXFLAGS="-fPIC"
+  else
+    execute ./configure --prefix="${WORKSPACE}" --enable-static --enable-pic
+  fi
+
+  execute make -j $MJOBS
+  execute make install
+  execute make install-lib-static
+
+  build_done "x264"
+fi
+CONFIGURE_OPTIONS+=("--enable-libx264")
+fi
+
+if $NONFREE_AND_GPL; then
+if build "x265"; then
+  download "https://github.com/videolan/x265/archive/Release_3.5.tar.gz" "x265-3.5.tar.gz"
+  cd build/linux || exit
+
+  execute cmake -DCMAKE_INSTALL_PREFIX="${WORKSPACE}" -DENABLE_SHARED=off -DBUILD_SHARED_LIBS=OFF ../../source
+  execute make -j $MJOBS
+  execute make install
+
+  if [ -n "$LDEXEFLAGS" ]; then
+    sed -i.backup 's/-lgcc_s/-lgcc_eh/g' "${WORKSPACE}/lib/pkgconfig/x265.pc" # The -i.backup is intended and required on MacOS: https://stackoverflow.com/questions/5694228/sed-in-place-flag-that-works-both-on-mac-bsd-and-linux
+  fi
+
+  build_done "x265"
+fi
+CONFIGURE_OPTIONS+=("--enable-libx265")
+fi
+
+if build "libvpx"; then
+  download "https://github.com/webmproject/libvpx/archive/v1.13.1.tar.gz" "libvpx-1.13.1.tar.gz"
+
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    echo "Applying Darwin patch"
+    sed "s/,--version-script//g" build/make/Makefile >build/make/Makefile.patched
+    sed "s/-Wl,--no-undefined -Wl,-soname/-Wl,-undefined,error -Wl,-install_name/g" build/make/Makefile.patched >build/make/Makefile
+  fi
+
+  execute ./configure --prefix="${WORKSPACE}" --disable-unit-tests --disable-shared --as=yasm
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "libvpx"
+fi
+CONFIGURE_OPTIONS+=("--enable-libvpx")
+
+if $NONFREE_AND_GPL; then
+if build "xvidcore"; then
+  download "https://downloads.xvid.com/downloads/xvidcore-1.3.7.tar.gz"
+  cd build/generic || exit
+  execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static
+  execute make -j $MJOBS
+  execute make install
+
+  if [[ -f ${WORKSPACE}/lib/libxvidcore.4.dylib ]]; then
+    execute rm "${WORKSPACE}/lib/libxvidcore.4.dylib"
+  fi
+
+  if [[ -f ${WORKSPACE}/lib/libxvidcore.so ]]; then
+    execute rm "${WORKSPACE}"/lib/libxvidcore.so*
+  fi
+
+  build_done "xvidcore"
+fi
+CONFIGURE_OPTIONS+=("--enable-libxvid")
+fi
+
+if $NONFREE_AND_GPL; then
+if build "vid_stab"; then
+  download "https://github.com/georgmartius/vid.stab/archive/v1.1.1.tar.gz" "vid.stab-1.1.1.tar.gz"
+
+  if $MACOS_M1; then
+    curl -s -o "$PACKAGES/vid.stab-1.1.0/fix_cmake_quoting.patch" https://raw.githubusercontent.com/Homebrew/formula-patches/5bf1a0e0cfe666ee410305cece9c9c755641bfdf/libvidstab/fix_cmake_quoting.patch
+    patch -p1 <fix_cmake_quoting.patch
+  fi
+
+  execute cmake -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX="${WORKSPACE}" -DUSE_OMP=OFF -DENABLE_SHARED=off .
+  execute make
+  execute make install
+
+  build_done "vid_stab"
+fi
+CONFIGURE_OPTIONS+=("--enable-libvidstab")
+fi
+
+if build "av1"; then
+  download "https://aomedia.googlesource.com/aom/+archive/b681eac83963950afc7be55df56c22fa5210aaa2.tar.gz" "av1.tar.gz" "av1"
+  make_dir "$PACKAGES"/aom_build
+  cd "$PACKAGES"/aom_build || exit
+  if $MACOS_M1; then
+    execute cmake -DENABLE_TESTS=0 -DCMAKE_INSTALL_PREFIX="${WORKSPACE}" -DCMAKE_INSTALL_LIBDIR=lib -DCONFIG_RUNTIME_CPU_DETECT=0 "$PACKAGES"/av1
+  else
+    execute cmake -DENABLE_TESTS=0 -DCMAKE_INSTALL_PREFIX="${WORKSPACE}" -DCMAKE_INSTALL_LIBDIR=lib "$PACKAGES"/av1
+  fi
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "av1"
+fi
+CONFIGURE_OPTIONS+=("--enable-libaom")
+
+##
+## audio library
+##
+
+if build "opencore"; then
+  download "https://deac-riga.dl.sourceforge.net/project/opencore-amr/opencore-amr/opencore-amr-0.1.6.tar.gz"
+  execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "opencore"
+fi
+CONFIGURE_OPTIONS+=("--enable-libopencore_amrnb" "--enable-libopencore_amrwb")
+
+if build "lame"; then
+  download "https://netcologne.dl.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz"
+  execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "lame"
+fi
+CONFIGURE_OPTIONS+=("--enable-libmp3lame")
+
+if build "opus"; then
+  download "https://archive.mozilla.org/pub/opus/opus-1.3.1.tar.gz"
+  execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "opus"
+fi
+CONFIGURE_OPTIONS+=("--enable-libopus")
+
+if build "libogg"; then
+  download "https://ftp.osuosl.org/pub/xiph/releases/ogg/libogg-1.3.5.tar.gz"
+  execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static
+  execute make -j $MJOBS
+  execute make install
+  build_done "libogg"
+fi
+
+if build "libvorbis"; then
+  download "https://ftp.osuosl.org/pub/xiph/releases/vorbis/libvorbis-1.3.7.tar.gz"
+  execute ./configure --prefix="${WORKSPACE}" --with-ogg-libraries="${WORKSPACE}"/lib --with-ogg-includes="${WORKSPACE}"/include/ --enable-static --disable-shared --disable-oggtest
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "libvorbis"
+fi
+CONFIGURE_OPTIONS+=("--enable-libvorbis")
+
+if build "libtheora"; then
+  download "https://ftp.osuosl.org/pub/xiph/releases/theora/libtheora-1.1.1.tar.gz"
+  sed "s/-fforce-addr//g" configure >configure.patched
+  chmod +x configure.patched
+  mv configure.patched configure
+  execute ./configure --prefix="${WORKSPACE}" --with-ogg-libraries="${WORKSPACE}"/lib --with-ogg-includes="${WORKSPACE}"/include/ --with-vorbis-libraries="${WORKSPACE}"/lib --with-vorbis-includes="${WORKSPACE}"/include/ --enable-static --disable-shared --disable-oggtest --disable-vorbistest --disable-examples --disable-asm --disable-spec
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "libtheora"
+fi
+CONFIGURE_OPTIONS+=("--enable-libtheora")
+
+if build "libgsm"; then
+  download "https://www.quut.com/gsm/gsm-1.0.22.tar.gz"
+  execute make all -j $MJOBS INSTALL_ROOT="${WORKSPACE}" GSM_INSTALL_INC="${WORKSPACE}/include" RANLIB=true
+  execute make install INSTALL_ROOT="${WORKSPACE}" GSM_INSTALL_INC="${WORKSPACE}/include" RANLIB=true
+  # Doesn't make one so we do
+  cat << _EOF_ > "${WORKSPACE}/lib/pkgconfig/libgsm.pc"
+prefix=${WORKSPACE}
+exec_prefix=\${prefix}
+bindir=\${prefix}/bin
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+
+Name: libgsm
+Description: Lossy speech compression library"
+URL: https://www.quut.com/gsm
+Version: 1.0.22
+Libs: -L\${libdir} -lgsm
+Cflags: -I\${includedir}
+_EOF_
+
+  build_done "libgsm"
+fi
+CONFIGURE_OPTIONS+=("--enable-libgsm")
+
+if build "freetype"; then
+  download "https://downloads.sourceforge.net/project/freetype/freetype2/2.13.2/freetype-2.13.2.tar.xz"
+  sed -i'' "s/%PKG_CONFIG%/pkg-config/g" builds/unix/freetype-config.in
+  execute ./configure --prefix="${WORKSPACE}" --enable-freetype-config --without-harfbuzz --enable-static --disable-shared --with-bzip2=yes
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "freetype"
+fi
+CONFIGURE_OPTIONS+=("--enable-libfreetype")
+
+if build "fontconfig"; then
+  download "https://www.freedesktop.org/software/fontconfig/release/fontconfig-2.14.2.tar.xz"
+  execute ./configure --prefix="${WORKSPACE}" --disable-dependency-tracking --disable-silent-rules --disable-docs --enable-static --disable-shared
+  execute make install RUN_FC_CACHE_TEST=false
+
+  # Fix for static libraries that aren't all included by other packages when linking
+  sed -i'' -e 's/^Requires:.*/Requires:  freetype2 >= 21.0.15, expat/g' -e 's/^Requires.private:.*/Requires.private:/g' -e 's/^Libs.private:.*/Libs.private: -lexpat/g' ${WORKSPACE}/lib/pkgconfig/fontconfig.pc
+
+  build_done "fontconfig"
+fi
+CONFIGURE_OPTIONS+=("--enable-libfontconfig")
+
+if build "libxml2"; then
+  download "https://download.gnome.org/sources/libxml2/2.12/libxml2-2.12.2.tar.xz"
+  export LIBS=-lstdc++
+  execute ./configure --prefix="${WORKSPACE}" --disable-silent-rules --with-history --with-icu --without-python --without-lzma --enable-static --disable-shared 
+  unset LIBS
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "libxml2"
+fi
+CONFIGURE_OPTIONS+=("--enable-libxml2")
+
+if build "libbluray"; then
+  download "https://download.videolan.org/videolan/libbluray/1.3.4/libbluray-1.3.4.tar.bz2"
+  export LIBS=-lstdc++
+  execute ./configure --prefix="${WORKSPACE}" --disable-dependency-tracking --disable-silent-rules --disable-bdjava-jar --enable-static --disable-shared
+  unset LIBS
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "libbluray"
+fi
+CONFIGURE_OPTIONS+=("--enable-libbluray")
+
+if build "fribidi"; then
+  download "https://github.com/fribidi/fribidi/releases/download/v1.0.13/fribidi-1.0.13.tar.xz"
+  execute ./configure --prefix="${WORKSPACE}" --enable-static --disable-shared --disable-dependency-tracking --disable-silent-rrules --disable-debug
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "fribidi"
+fi
+CONFIGURE_OPTIONS+=("--enable-libfribidi")
+
+if build "graphite2"; then
+  download "https://github.com/silnrsi/graphite/releases/download/1.3.14/graphite2-1.3.14.tgz"
+  # This prevents the tests failing because of a lack of including all the other static libraries
+  # if there's a way to add the libs after the one in asterisks to the list it would fix it
+  # */app/workspace/lib/libfreetype.a* /app/workspace/lib/libpng.a /app/workspace/lib/libz.a /app/workspace/lib/libbz2.a
+  sed -i'' -e 's|^enable_testing.*|#enable_testing()|g' -e 's|^add_subdirectory(tests)|#Disable tests directory|g' -e 's|^add_subdirectory(doc)|#Disable doc directory|g' -e 's|.*add_subdirectory(gr2fonttest)|    #Disable gr2fonttest directory|g' CMakeLists.txt
+  execute cmake -DCMAKE_INSTALL_PREFIX="${WORKSPACE}" -DENABLE_SHARED=off -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_VERBOSE_MAKEFILE=ON -Wno-dev -DBUILD_TESTING=OFF .
+  execute make install -j $MJOBS
+
+  build_done "graphite2"
+fi
+
+if build "pixman"; then
+  download "https://cairographics.org/releases/pixman-0.42.2.tar.gz"
+  execute ./configure --prefix="${WORKSPACE}" --disable-debug --disable-dependency-tracking --enable-static --disable-shared --disable-gtk --disable-silent-rrules
+  execute make install -j $MJOBS
+
+  build_done "pixman"
+fi
+
+if build "cairo"; then
+  download "https://cairographics.org/releases/cairo-1.18.0.tar.xz"
+  execute meson setup build --prefix="${WORKSPACE}" --libdir=lib --buildtype=release --wrap-mode=nofallback -Dtests=disabled --default-library=static -Dfontconfig=enabled -Dfreetype=enabled -Dpng=enabled -Dglib=enabled -Dxcb=disabled -Dxlib=disabled -Dzlib=enabled -Dglib=enabled
+  execute meson compile -C build --verbose
+  execute meson install -C build
+
+  build_done "cairo"
+fi
+
+if build "harfbuzz"; then
+  download "https://github.com/harfbuzz/harfbuzz/archive/refs/tags/8.3.0.tar.gz"
+  execute meson setup build --prefix="${WORKSPACE}" --libdir=lib --buildtype=release --wrap-mode=nofallback -Dtests=disabled -Dicu=enabled -Dintrospection=disabled -Dgraphite=enabled -Dgobject=enabled -Dglib=enabled -Dfreetype=enabled -Dcoretext=enabled -Dcairo=enabled --default-library=static
+  execute meson compile -C build --verbose
+  execute meson install -C build
+
+  build_done "harfbuzz"
+fi
+
+if build "libass"; then
+  download "https://github.com/libass/libass/releases/download/0.17.1/libass-0.17.1.tar.xz"
+  execute ./configure --prefix="${WORKSPACE}" --disable-dependency-tracking --enable-static --disable-shared
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "libass"
+fi
+CONFIGURE_OPTIONS+=("--enable-libass")
+
+if build "libdrm"; then
+  download "https://dri.freedesktop.org/libdrm/libdrm-2.4.118.tar.xz"
+  execute meson setup build --prefix="${WORKSPACE}" --libdir=lib --buildtype=release --wrap-mode=nofallback -Dtests=false --default-library=static -Dcairo-tests=disabled -Dvalgrind=disabled
+  execute meson compile -C build --verbose
+  execute meson install -C build
+
+  build_done "libdrm"
+fi
+CONFIGURE_OPTIONS+=("--enable-libdrm")
+
+if build "speex"; then
+  download "https://downloads.xiph.org/releases/speex/speex-1.2.1.tar.gz"
+  execute ./configure --prefix="${WORKSPACE}" --disable-dependency-tracking --enable-static --disable-shared
+  execute make install -j $MJOBS
+
+  build_done "speex"
+fi
+CONFIGURE_OPTIONS+=("--enable-libspeex")
+
+if build "gmp"; then
+  download "https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz"
+  execute ./configure --prefix="${WORKSPACE}" --disable-dependency-tracking --enable-static --disable-shared --enable-cxx --with-pic --build=x86_64-linux-gnu
+  execute make -j $MJOBS
+  execute make check
+  execute make install
+
+  build_done "gmp"
+fi
+CONFIGURE_OPTIONS+=("--enable-gmp")
+
+if build "dav1d"; then
+  download "https://code.videolan.org/videolan/dav1d/-/archive/1.3.0/dav1d-1.3.0.tar.bz2"
+  execute meson setup build --prefix="${WORKSPACE}" --libdir=lib --buildtype=release --wrap-mode=nofallback --default-library=static -Denable_tests=false
+  execute meson compile -C build --verbose
+  execute meson install -C build
+
+  build_done "dav1d"
+fi
+CONFIGURE_OPTIONS+=("--enable-libdav1d")
+
+if $NONFREE_AND_GPL; then
+if build "fdk_aac"; then
+  download "https://sourceforge.net/projects/opencore-amr/files/fdk-aac/fdk-aac-2.0.2.tar.gz/download?use_mirror=gigenet" "fdk-aac-2.0.2.tar.gz"
+  execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "fdk_aac"
+fi
+CONFIGURE_OPTIONS+=("--enable-libfdk-aac")
+fi
+
+##
+## image library
+##
+
+if build "libwebp"; then
+  download "https://github.com/webmproject/libwebp/archive/v1.3.2.tar.gz" "libwebp-1.3.2.tar.gz"
+  make_dir build
+  cd build || exit
+  execute cmake -DCMAKE_INSTALL_PREFIX="${WORKSPACE}" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_INSTALL_BINDIR=bin -DCMAKE_INSTALL_INCLUDEDIR=include -DENABLE_SHARED=OFF -DENABLE_STATIC=ON ../
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "libwebp"
+fi
+CONFIGURE_OPTIONS+=("--enable-libwebp")
+
+##
+## other library
+##
+
+if build "libsdl"; then
+  download "https://www.libsdl.org/release/SDL2-2.28.5.tar.gz"
+  execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static --without-x
+  execute make -j $MJOBS
+  execute make install
+
+  build_done "libsdl"
+fi
+
+if $NONFREE_AND_GPL; then
+if build "srt"; then
+  download "https://github.com/Haivision/srt/archive/refs/tags/v1.5.3.tar.gz" "srt-1.5.3.tar.gz"
+  export OPENSSL_ROOT_DIR="${WORKSPACE}"
+  export OPENSSL_LIB_DIR="${WORKSPACE}"/lib
+  export OPENSSL_INCLUDE_DIR="${WORKSPACE}"/include/
+  execute cmake . -DCMAKE_INSTALL_PREFIX="${WORKSPACE}" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_INSTALL_BINDIR=bin -DCMAKE_INSTALL_INCLUDEDIR=include -DENABLE_SHARED=OFF -DENABLE_STATIC=ON -DENABLE_APPS=OFF -DUSE_STATIC_LIBSTDCXX=ON
+  execute make install
+
+  if [ -n "$LDEXEFLAGS" ]; then
+    sed -i.backup 's/-lgcc_s/-lgcc_eh/g' "${WORKSPACE}"/lib/pkgconfig/srt.pc # The -i.backup is intended and required on MacOS: https://stackoverflow.com/questions/5694228/sed-in-place-flag-that-works-both-on-mac-bsd-and-linux
+  fi
+
+  build_done "srt"
+fi
+CONFIGURE_OPTIONS+=("--enable-libsrt")
+fi
+
+##
+## HWaccel library
+##
+
+if [[ "$OSTYPE" == "linux-gnu" ]]; then
+  if command_exists "nvcc"; then
+    if build "nv-codec"; then
+      download "https://github.com/FFmpeg/nv-codec-headers/releases/download/n12.1.14.0/nv-codec-headers-12.1.14.0.tar.gz"
+      execute make PREFIX="${WORKSPACE}"
+      execute make install PREFIX="${WORKSPACE}"
+      build_done "nv-codec"
+    fi
+    CFLAGS+=" -I/usr/local/cuda/include"
+    LDFLAGS+=" -L/usr/local/cuda/lib64"
+    CONFIGURE_OPTIONS+=("--enable-cuda-nvcc" "--enable-cuvid" "--enable-nvenc" "--enable-cuda-llvm")
+
+    if [ -z "$LDEXEFLAGS" ]; then
+      CONFIGURE_OPTIONS+=("--enable-libnpp") # Only libnpp cannot be statically linked.
+    fi
+
+    # https://arnon.dk/matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/
+    CONFIGURE_OPTIONS+=("--nvccflags=-gencode arch=compute_52,code=sm_52")
+  fi
+
+  # Vaapi doesn't work well with static links FFmpeg.
+  if [ -z "$LDEXEFLAGS" ]; then
+    # If the libva development SDK is installed, enable vaapi.
+    if library_exists "libva"; then
+      if build "vaapi"; then
+        build_done "vaapi"
+      fi
+      CONFIGURE_OPTIONS+=("--enable-vaapi")
+    fi
+  fi
+fi
+
+##
+## FFmpeg
+##
+
+build "ffmpeg"
+download "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n6.1.tar.gz" "ffmpeg-6.1.tar.gz"
+patch -p1 < /app/ffmpeg_ac4.patch
+echo "*** Configure command ***"
+echo ./configure "${CONFIGURE_OPTIONS[@]}" \
+  --disable-stripping \
+  --disable-debug \
+  --disable-doc \
+  --disable-shared \
+  --enable-pthreads \
+  --enable-static \
+  --enable-small \
+  --enable-version3 \
+  --extra-cflags=\"${CFLAGS}\" \
+  --extra-ldexeflags=\"${LDEXEFLAGS}\" \
+  --extra-ldflags=\"${LDFLAGS}\" \
+  --extra-libs=\"${EXTRALIBS}\" \
+  --disable-large-tests \
+  --pkgconfigdir=\"$WORKSPACE/lib/pkgconfig\" \
+  --pkg-config-flags=\"--static\" \
+  --prefix=\"${WORKSPACE}\"
+
+# shellcheck disable=SC2086
+./configure "${CONFIGURE_OPTIONS[@]}" \
+  --disable-stripping \
+  --disable-debug \
+  --disable-doc \
+  --disable-shared \
+  --enable-pthreads \
+  --enable-static \
+  --enable-small \
+  --enable-version3 \
+  --extra-cflags="${CFLAGS}" \
+  --extra-ldexeflags="${LDEXEFLAGS}" \
+  --extra-ldflags="${LDFLAGS}" \
+  --extra-libs="${EXTRALIBS}" \
+  --pkgconfigdir="$WORKSPACE/lib/pkgconfig" \
+  --pkg-config-flags="--static" \
+  --prefix="${WORKSPACE}"
+
+execute make -j $MJOBS
+execute make install
+
+INSTALL_FOLDER="/usr/bin"
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  INSTALL_FOLDER="/usr/local/bin"
+fi
+
+verify_binary_type
+
+echo ""
+echo "Building done. The following binaries can be found here:"
+echo "- ffmpeg: $WORKSPACE/bin/ffmpeg"
+echo "- ffprobe: $WORKSPACE/bin/ffprobe"
+echo "- ffplay: $WORKSPACE/bin/ffplay"
+
+echo ""
+
+if [[ "$AUTOINSTALL" == "yes" ]]; then
+  if command_exists "sudo"; then
+    sudo cp "$WORKSPACE/bin/ffmpeg" "$INSTALL_FOLDER/ffmpeg"
+    sudo cp "$WORKSPACE/bin/ffprobe" "$INSTALL_FOLDER/ffprobe"
+    sudo cp "$WORKSPACE/bin/ffplay" "$INSTALL_FOLDER/ffplay"
+    echo "Done. FFmpeg is now installed to your system."
+  else
+    cp "$WORKSPACE/bin/ffmpeg" "$INSTALL_FOLDER/ffmpeg"
+    cp "$WORKSPACE/bin/ffprobe" "$INSTALL_FOLDER/ffprobe"
+    sudo cp "$WORKSPACE/bin/ffplay" "$INSTALL_FOLDER/ffplay"
+    echo "Done. FFmpeg is now installed to your system."
+  fi
+elif [[ ! "$SKIPINSTALL" == "yes" ]]; then
+  read -r -p "Install these binaries to your $INSTALL_FOLDER folder? Existing binaries will be replaced. [Y/n] " response
+  case $response in
+  [yY][eE][sS] | [yY])
+    if command_exists "sudo"; then
+      sudo cp "$WORKSPACE/bin/ffmpeg" "$INSTALL_FOLDER/ffmpeg"
+      sudo cp "$WORKSPACE/bin/ffprobe" "$INSTALL_FOLDER/ffprobe"
+      sudo cp "$WORKSPACE/bin/ffplay" "$INSTALL_FOLDER/ffplay"
+    else
+      cp "$WORKSPACE/bin/ffmpeg" "$INSTALL_FOLDER/ffmpeg"
+      cp "$WORKSPACE/bin/ffprobe" "$INSTALL_FOLDER/ffprobe"
+      cp "$WORKSPACE/bin/ffplay" "$INSTALL_FOLDER/ffplay"
+    fi
+    echo "Done. FFmpeg is now installed to your system."
+    ;;
+  esac
+fi
+
+exit 0
