@@ -739,8 +739,10 @@ CONFIGURE_OPTIONS+=("--enable-libfontconfig")
 if build "libxml2"; then
   download "https://download.gnome.org/sources/libxml2/2.12/libxml2-2.12.2.tar.xz"
   export LIBS=-lstdc++
-  execute ./configure --prefix="${WORKSPACE}" --disable-silent-rules --with-history --with-icu --without-python --without-lzma --enable-static --disable-shared 
+  export PKG_CONFIG="${WORKSPACE}/bin/pkg-config"
+  execute ./configure --prefix="${WORKSPACE}" --disable-silent-rules --with-history --with-icu --without-python --without-lzma --enable-static --disable-shared --with-zlib="${WORKSPACE}/lib"
   unset LIBS
+  unset PKG_CONFIG
   execute make -j $MJOBS
   execute make install
 
@@ -800,7 +802,7 @@ if build "cairo"; then
 fi
 
 if build "harfbuzz"; then
-  download "https://github.com/harfbuzz/harfbuzz/archive/refs/tags/8.3.0.tar.gz"
+  download "https://github.com/harfbuzz/harfbuzz/archive/refs/tags/8.3.0.tar.gz" "harfbuzz-8.3.0.tar.gz"
   execute meson setup build --prefix="${WORKSPACE}" --libdir=lib --buildtype=release --wrap-mode=nofallback -Dtests=disabled -Dicu=enabled -Dintrospection=disabled -Dgraphite=enabled -Dgobject=enabled -Dglib=enabled -Dfreetype=enabled -Dcoretext=enabled -Dcairo=enabled --default-library=static
   execute meson compile -C build --verbose
   execute meson install -C build
@@ -975,6 +977,7 @@ echo ./configure "${CONFIGURE_OPTIONS[@]}" \
   --extra-ldflags=\"${LDFLAGS}\" \
   --extra-libs=\"${EXTRALIBS}\" \
   --disable-large-tests \
+  --pkg-config=\"${WORKSPACE}/bin/pkg-config\" \
   --pkgconfigdir=\"$WORKSPACE/lib/pkgconfig\" \
   --pkg-config-flags=\"--static\" \
   --prefix=\"${WORKSPACE}\"
@@ -993,6 +996,7 @@ echo ./configure "${CONFIGURE_OPTIONS[@]}" \
   --extra-ldexeflags="${LDEXEFLAGS}" \
   --extra-ldflags="${LDFLAGS}" \
   --extra-libs="${EXTRALIBS}" \
+  --pkg-config="${WORKSPACE}/bin/pkg-config" \
   --pkgconfigdir="$WORKSPACE/lib/pkgconfig" \
   --pkg-config-flags="--static" \
   --prefix="${WORKSPACE}"
