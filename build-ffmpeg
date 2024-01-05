@@ -726,8 +726,9 @@ CONFIGURE_OPTIONS+=("--enable-libfreetype")
 
 if build "fontconfig"; then
   download "https://www.freedesktop.org/software/fontconfig/release/fontconfig-2.14.2.tar.xz"
-  execute ./configure --prefix="${WORKSPACE}" --disable-dependency-tracking --disable-silent-rules --disable-docs --enable-static --disable-shared
-  execute make install RUN_FC_CACHE_TEST=false
+  execute ./configure --prefix="${WORKSPACE}" --sysconfdir=/etc --disable-dependency-tracking --disable-silent-rules --disable-docs --enable-static --disable-shared
+  execute make install-exec RUN_FC_CACHE_TEST=false
+  execute cp fontconfig.pc "${WORKSPACE}/lib/pkgconfig/"
 
   # Fix for static libraries that aren't all included by other packages when linking
   sed -i'' -e 's/^Requires:.*/Requires:  freetype2 >= 21.0.15, expat/g' -e 's/^Requires.private:.*/Requires.private:/g' -e 's/^Libs.private:.*/Libs.private: -lexpat/g' ${WORKSPACE}/lib/pkgconfig/fontconfig.pc
