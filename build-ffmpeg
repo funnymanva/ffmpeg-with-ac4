@@ -260,7 +260,7 @@ mkdir -p "$PACKAGES"
 mkdir -p "$WORKSPACE"
 
 export PATH="${WORKSPACE}/bin:$PATH"
-PKG_CONFIG_PATH="${WORKSPACE}/lib64/pkgconfig:/app/workspace/lib/pkgconfi"
+PKG_CONFIG_PATH="${WORKSPACE}/lib64/pkgconfig:/app/workspace/lib/pkgconfig"
 PKG_CONFIG_PATH+=":/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig"
 PKG_CONFIG_PATH+=":/usr/local/share/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig:/usr/lib64/pkgconfig"
 export PKG_CONFIG_PATH
@@ -959,7 +959,7 @@ fi
 
 build "ffmpeg"
 download "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n6.1.tar.gz" "ffmpeg-6.1.tar.gz"
-patch -p1 < /app/ffmpeg_ac4.patch
+patch -p1 < "${CWD}/ffmpeg_ac4.patch"
 echo "*** Configure command ***"
 echo ./configure "${CONFIGURE_OPTIONS[@]}" \
   --disable-stripping \
