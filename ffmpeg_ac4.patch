@@ -1,21 +1,21 @@
 diff --git a/libavcodec/Makefile b/libavcodec/Makefile
-index fd9883d2ca..ef27e1d22d 100644
+index 2ea4f94..91d8233 100644
 --- a/libavcodec/Makefile
 +++ b/libavcodec/Makefile
-@@ -203,6 +203,7 @@ OBJS-$(CONFIG_AC3_ENCODER)             += ac3enc_float.o ac3enc.o ac3tab.o \
+@@ -220,6 +220,7 @@ OBJS-$(CONFIG_AC3_ENCODER)             += ac3enc_float.o ac3enc.o ac3tab.o \
                                            ac3.o kbdwin.o
  OBJS-$(CONFIG_AC3_FIXED_ENCODER)       += ac3enc_fixed.o ac3enc.o ac3tab.o ac3.o kbdwin.o
  OBJS-$(CONFIG_AC3_MF_ENCODER)          += mfenc.o mf_utils.o
 +OBJS-$(CONFIG_AC4_DECODER)             += ac4dec.o kbdwin.o
- OBJS-$(CONFIG_ACELP_KELVIN_DECODER)    += g729dec.o lsp.o celp_math.o celp_filters.o acelp_filters.o acelp_pitch_delay.o acelp_vectors.o g729postfilter.o
+ OBJS-$(CONFIG_ACELP_KELVIN_DECODER)    += g729dec.o lsp.o celp_filters.o acelp_filters.o acelp_pitch_delay.o acelp_vectors.o g729postfilter.o
  OBJS-$(CONFIG_AGM_DECODER)             += agm.o jpegquanttables.o
- OBJS-$(CONFIG_AIC_DECODER)             += aic.o
+ OBJS-$(CONFIG_AHX_DECODER)             += mpegaudiodec_float.o
 diff --git a/libavcodec/ac4dec.c b/libavcodec/ac4dec.c
 new file mode 100644
-index 0000000000..ef323be1e8
+index 0000000..c71f722
 --- /dev/null
 +++ b/libavcodec/ac4dec.c
-@@ -0,0 +1,5892 @@
+@@ -0,0 +1,5906 @@
 +/*
 + * AC-4 Audio Decoder
 + *
@@ -46,6 +46,7 @@ index 0000000000..ef323be1e8
 +#include "libavutil/tx.h"
 +#include "libavutil/channel_layout.h"
 +#include "libavutil/float_dsp.h"
++#include "libavutil/mem.h"
 +#include "libavutil/mem_internal.h"
 +#include "libavutil/thread.h"
 +#include "libavutil/qsort.h"
@@ -58,6 +59,16 @@ index 0000000000..ef323be1e8
 +#include "get_bits.h"
 +#include "kbdwin.h"
 +#include "unary.h"
++
++/* VLC_INIT_STATIC was removed from vlc.h in FFmpeg 7; keep a local equivalent. */
++#define VLC_INIT_STATIC(vlc, bits, a, b, c, d, e, f, g, static_size)      \
++    do {                                                                  \
++        static VLCElem table[static_size];                                \
++        (vlc)->table           = table;                                   \
++        (vlc)->table_allocated = static_size;                             \
++        ff_vlc_init_sparse(vlc, bits, a, b, c, d, e, f, g, NULL, 0, 0,    \
++                           VLC_INIT_USE_STATIC);                          \
++    } while (0)
 +
 +/* Number of model bits */
 +#define SSF_MODEL_BITS 15
@@ -749,7 +760,7 @@ index 0000000000..ef323be1e8
 +            if ((ret = av_tx_init(&s->tx_ctx[j][i], &s->tx_fn[j][i], AV_TX_FLOAT_MDCT, 1, N_w, &scale, 0)))
 +                return ret;
 +
-+            avpriv_kbd_window_init(s->kbd_window[j][i], alpha, N_w);
++            ff_kbd_window_init(s->kbd_window[j][i], alpha, N_w);
 +        }
 +    }
 +
@@ -5782,8 +5793,9 @@ index 0000000000..ef323be1e8
 +    presentation = FFMIN(s->target_presentation, FFMAX(0, s->nb_presentations - 1));
 +    ssinfo = s->version == 2 ? &s->ssgroup[0].ssinfo : &s->pinfo[presentation].ssinfo;
 +    avctx->sample_rate = s->fs_index ? 48000 : 44100;
-+    avctx->channels = channel_mode_nb_channels[ssinfo->channel_mode];
-+    avctx->ch_layout = ff_ac4_ch_layouts[ssinfo->channel_mode];
++    av_channel_layout_uninit(&avctx->ch_layout);
++    if ((ret = av_channel_layout_copy(&avctx->ch_layout, &ff_ac4_ch_layouts[ssinfo->channel_mode])) < 0)
++        return ret;
 +    //frame->nb_samples = av_rescale(s->frame_len_base,
 +    //                               s->resampling_ratio.num,
 +    //                               s->resampling_ratio.den);
@@ -5816,7 +5828,7 @@ index 0000000000..ef323be1e8
 +    if (get_bits_left(gb) < 0)
 +        av_log(s->avctx, AV_LOG_WARNING, "overread\n");
 +
-+    for (int ch = 0; ch < avctx->channels; ch++)
++    for (int ch = 0; ch < avctx->ch_layout.nb_channels; ch++)
 +        scale_spec(s, ch);
 +
 +    switch (ssinfo->channel_mode) {
@@ -5832,7 +5844,7 @@ index 0000000000..ef323be1e8
 +        break;
 +    }
 +
-+    for (int ch = 0; ch < avctx->channels; ch++)
++    for (int ch = 0; ch < avctx->ch_layout.nb_channels; ch++)
 +        prepare_channel(s, ch);
 +
 +    switch (ssinfo->channel_mode) {
@@ -5847,10 +5859,13 @@ index 0000000000..ef323be1e8
 +        break;
 +    }
 +
-+    for (int ch = 0; ch < avctx->channels; ch++)
++    for (int ch = 0; ch < avctx->ch_layout.nb_channels; ch++)
 +        decode_channel(s, ch, (float *)frame->extended_data[ch]);
 +
-+    frame->key_frame = s->iframe_global;
++    if (s->iframe_global)
++        frame->flags |= AV_FRAME_FLAG_KEY;
++    else
++        frame->flags &= ~AV_FRAME_FLAG_KEY;
 +
 +    *got_frame_ptr = 1;
 +
@@ -5893,7 +5908,7 @@ index 0000000000..ef323be1e8
 +    .version    = LIBAVUTIL_VERSION_INT,
 +};
 +
-+FFCodec ff_ac4_decoder = {
++const FFCodec ff_ac4_decoder = {
 +    .p.name           = "ac4",
 +    CODEC_LONG_NAME("Dolby AC-4"),
 +    .p.type           = AVMEDIA_TYPE_AUDIO,
@@ -5905,12 +5920,11 @@ index 0000000000..ef323be1e8
 +    FF_CODEC_DECODE_CB(ac4_decode_frame),
 +    .flush          = ac4_flush,
 +    .p.capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
-+    .p.sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_FLTP,
-+                                                      AV_SAMPLE_FMT_NONE },
++    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_FLTP),
 +};
 diff --git a/libavcodec/ac4dec_data.h b/libavcodec/ac4dec_data.h
 new file mode 100644
-index 0000000000..1757b44686
+index 0000000..1757b44
 --- /dev/null
 +++ b/libavcodec/ac4dec_data.h
 @@ -0,0 +1,1664 @@
@@ -7580,24 +7594,24 @@ index 0000000000..1757b44686
 +#endif /* AVCODEC_AC4DECDATA_H */
 \ No newline at end of file
 diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
-index b0f004e15c..25349ffdd0 100644
+index b12dcc4..e76c357 100644
 --- a/libavcodec/allcodecs.c
 +++ b/libavcodec/allcodecs.c
-@@ -435,6 +435,7 @@ extern const FFCodec ff_ac3_encoder;
+@@ -431,6 +431,7 @@ extern const FFCodec ff_ac3_encoder;
  extern const FFCodec ff_ac3_decoder;
  extern const FFCodec ff_ac3_fixed_encoder;
  extern const FFCodec ff_ac3_fixed_decoder;
 +extern const FFCodec ff_ac4_decoder;
  extern const FFCodec ff_acelp_kelvin_decoder;
+ extern const FFCodec ff_ahx_decoder;
  extern const FFCodec ff_alac_encoder;
- extern const FFCodec ff_alac_decoder;
 diff --git a/libavcodec/kbdwin.h b/libavcodec/kbdwin.h
-index 0cb2073c5f..f19787607a 100644
+index 4185c42..2ea35e1 100644
 --- a/libavcodec/kbdwin.h
 +++ b/libavcodec/kbdwin.h
 @@ -24,7 +24,7 @@
  /**
-  * Maximum window size for avpriv_kbd_window_init.
+  * Maximum window size for ff_kbd_window_init.
   */
 -#define FF_KBD_WINDOW_MAX 1024
 +#define FF_KBD_WINDOW_MAX 2048

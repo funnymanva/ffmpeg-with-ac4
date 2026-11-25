@@ -1,38 +1,48 @@
-FROM ubuntu:22.04 AS build
+# Builds fully static (musl) Linux FFmpeg binaries with the AC-4 decoder.
+#
+# Extract just the binaries (see ./build-linux):
+#   container build --arch arm64 --target export -o type=local,dest=dist/linux-arm64 .
+#   docker buildx build --platform linux/amd64 --target export -o type=local,dest=dist/linux-amd64 .
+#
+# Or build a runnable image (default target):
+#   container build -t ffmpeg-ac4 .
 
-ENV DEBIAN_FRONTEND noninteractive
+ARG ALPINE_VERSION=3.24
 
-RUN apt-get update \
-    && apt-get -y --no-install-recommends install build-essential curl ca-certificates libva-dev python3 tcl meson gperf m4 \
-    && apt-get clean; rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /usr/share/doc/* \
-    && update-ca-certificates
+FROM alpine:${ALPINE_VERSION} AS build
+
+RUN apk add --no-cache \
+      bash build-base linux-headers curl ca-certificates perl python3 \
+      cmake meson samurai git tar xz bzip2 patch file gperf m4 diffutils coreutils
+
+# Options passed to build-ffmpeg
+ARG BUILD_OPTIONS="--enable-gpl-and-non-free --full-static"
+# Parallel jobs; empty = auto. build-linux sets this from the host's real RAM,
+# because /proc/meminfo inside a container can report the whole host.
+ARG NUMJOBS=""
 
 WORKDIR /app
-COPY ./build-ffmpeg /app/build-ffmpeg
-COPY ./ffmpeg_ac4.patch /app/ffmpeg_ac4.patch
+COPY ./build-ffmpeg ./ffmpeg_ac4.patch /app/
 
-RUN SKIPINSTALL=yes /app/build-ffmpeg --build --enable-gpl-and-non-free
+RUN NUMJOBS="${NUMJOBS}" SKIPINSTALL=yes ./build-ffmpeg --build ${BUILD_OPTIONS} \
+    && mkdir -p /out \
+    && cp workspace/bin/ffmpeg workspace/bin/ffprobe /out/ \
+    && if [ -f workspace/bin/ffplay ]; then cp workspace/bin/ffplay /out/; fi \
+    && file /out/*
 
-FROM ubuntu:22.04
+# Binaries only, for `-o type=local`
+FROM scratch AS export
+COPY --from=build /out/ /
 
-ENV DEBIAN_FRONTEND noninteractive
+# Runnable image
+FROM alpine:${ALPINE_VERSION}
 
-# install va-driver
-RUN apt-get update && \
-    apt-get -y dist-upgrade && \
-    apt-get -y install curl ca-certificates libva-drm2 && \
-    apt-get clean; rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /usr/share/doc/* && \
-    update-ca-certificates
+# fontconfig config + a font so drawtext/subtitles work
+RUN apk add --no-cache ca-certificates fontconfig font-dejavu
 
-# Copy ffmpeg
-COPY --from=build /app/workspace/bin/ffmpeg /usr/bin/ffmpeg
-COPY --from=build /app/workspace/bin/ffprobe /usr/bin/ffprobe
-COPY --from=build /app/workspace/bin/ffplay /usr/bin/ffplay
+COPY --from=build /out/ /usr/local/bin/
 
-# Check shared library
-RUN ldd /usr/bin/ffmpeg
-RUN ldd /usr/bin/ffprobe
-RUN ldd /usr/bin/ffplay
+RUN ffmpeg -hide_banner -decoders | grep -q ' ac4 '
 
-CMD         ["--help"]
-ENTRYPOINT  ["/usr/bin/ffmpeg"]
+ENTRYPOINT ["/usr/local/bin/ffmpeg"]
+CMD ["-hide_banner", "-version"]

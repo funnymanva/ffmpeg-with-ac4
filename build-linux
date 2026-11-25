@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+#
+# Build fully static Linux FFmpeg binaries inside a container and copy them to
+# ./dist/linux-<arch>/. Works with Apple's `container` (macOS), Podman or Docker.
+#
+# Usage: ./build-linux [arm64|amd64 ...]   (default: the host architecture)
+#
+# Environment:
+#   ENGINE         container | podman | docker (default: first one found, in that order)
+#   BUILD_CPUS     CPUs for the Apple container builder (default: all)
+#   BUILD_MEMORY   memory for the Apple container builder (default: 8G)
+#   NUMJOBS        parallel compile jobs (default: min(CPUs, GB of host RAM))
+#   PODMAN_NETWORK network mode for podman build (default: host if /dev/net/tun is missing)
+#   BUILD_OPTIONS  options passed to build-ffmpeg
+#                  (default: "--enable-gpl-and-non-free --full-static")
+
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+host_arch() {
+  case "$(uname -m)" in
+  arm64 | aarch64) echo arm64 ;;
+  x86_64 | amd64) echo amd64 ;;
+  *) uname -m ;;
+  esac
+}
+
+if [ -z "${ENGINE:-}" ]; then
+  for e in container podman docker; do
+    if command -v "$e" >/dev/null 2>&1; then
+      ENGINE=$e
+      break
+    fi
+  done
+fi
+if [ -z "${ENGINE:-}" ]; then
+  echo "No container engine found (container, podman or docker)." >&2
+  exit 1
+fi
+
+ARCHES=("$@")
+if [ ${#ARCHES[@]} -eq 0 ]; then
+  ARCHES=("$(host_arch)")
+fi
+
+BUILD_ARGS=()
+if [ -n "${BUILD_OPTIONS:-}" ]; then
+  BUILD_ARGS+=(--build-arg "BUILD_OPTIONS=${BUILD_OPTIONS}")
+fi
+
+# Docker/Podman builds share the host kernel, and /proc/meminfo inside the
+# container may show far more RAM than this machine (or LXC/VM) really has.
+# Size the job count here, from the host's view, and pass it in.
+if [ "$ENGINE" != container ] && [ -z "${NUMJOBS:-}" ] && [ -r /proc/meminfo ]; then
+  HOST_MEM_GB=$(awk '/^MemTotal:/ {print int(($2 + 524288) / 1048576)}' /proc/meminfo)
+  NUMJOBS=$(nproc 2>/dev/null || echo 4)
+  if [ "${HOST_MEM_GB:-0}" -ge 1 ] && [ "$NUMJOBS" -gt "$HOST_MEM_GB" ]; then
+    NUMJOBS=$HOST_MEM_GB
+  fi
+fi
+if [ -n "${NUMJOBS:-}" ]; then
+  echo "==> Using ${NUMJOBS} parallel jobs"
+  BUILD_ARGS+=(--build-arg "NUMJOBS=${NUMJOBS}")
+fi
+
+if [ "$ENGINE" = container ]; then
+  # Make sure the container system services are running
+  container system status >/dev/null 2>&1 || container system start
+  if [ "$(uname)" = Darwin ]; then
+    CPUS="${BUILD_CPUS:-$(sysctl -n hw.ncpu)}"
+  else
+    CPUS="${BUILD_CPUS:-4}"
+  fi
+  MEMORY="${BUILD_MEMORY:-8G}"
+fi
+
+for arch in "${ARCHES[@]}"; do
+  case "$arch" in
+  arm64 | aarch64) arch=arm64 ;;
+  amd64 | x86_64) arch=amd64 ;;
+  *)
+    echo "Unsupported architecture: $arch (use arm64 or amd64)" >&2
+    exit 1
+    ;;
+  esac
+
+  DEST="dist/linux-${arch}"
+  rm -rf "$DEST"
+  mkdir -p "$DEST"
+  echo "==> Building linux/${arch} with ${ENGINE} -> ${DEST}"
+
+  case "$ENGINE" in
+  container)
+    container build --arch "$arch" --cpus "$CPUS" --memory "$MEMORY" --progress plain \
+      "${BUILD_ARGS[@]}" --target export -o "type=local,dest=${DEST}" .
+    ;;
+  docker)
+    docker buildx build --platform "linux/${arch}" --progress plain \
+      "${BUILD_ARGS[@]}" --target export -o "type=local,dest=${DEST}" .
+    ;;
+  podman)
+    # Rootless Podman networking (slirp4netns/pasta) needs /dev/net/tun, which
+    # unprivileged LXC containers and some VMs lack; fall back to host networking.
+    PODMAN_NET_ARGS=()
+    if [ -n "${PODMAN_NETWORK:-}" ]; then
+      PODMAN_NET_ARGS=(--network "$PODMAN_NETWORK")
+    elif [ ! -e /dev/net/tun ]; then
+      echo "==> /dev/net/tun not available; using --network=host for podman"
+      PODMAN_NET_ARGS=(--network host)
+    fi
+    podman build --platform "linux/${arch}" "${PODMAN_NET_ARGS[@]}" \
+      "${BUILD_ARGS[@]}" --target export -o "type=local,dest=${DEST}" .
+    ;;
+  *)
+    echo "Unknown ENGINE: $ENGINE" >&2
+    exit 1
+    ;;
+  esac
+
+  # Apple's `container` nests local output as <dest>/out.tar/<os>_<arch>/;
+  # flatten it so the binaries end up directly in $DEST.
+  for bin in ffmpeg ffprobe ffplay; do
+    found="$(find "$DEST" -mindepth 2 -type f -name "$bin" | head -1)"
+    if [ -n "$found" ]; then
+      mv "$found" "$DEST/$bin"
+    fi
+  done
+  find "$DEST" -mindepth 1 -type d -prune -exec rm -rf {} +
+
+  echo "==> Built:"
+  ls -l "$DEST"
+done

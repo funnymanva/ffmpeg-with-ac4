@@ -1,2 +1,6 @@
 packages/
 workspace/
+dist/
+.git/
+.claude/
+.idea/
